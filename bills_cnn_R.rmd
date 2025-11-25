@@ -1,0 +1,30 @@
+---
+title: "bills_cnn_R"
+author: "Madelyn Redick"
+date: "2025-11-18"
+output: html_document
+---
+
+```{r}
+# imports 
+library(dplyr)
+
+# load data
+bills <- read.csv("bill_details.csv")
+
+# rename columns
+bills <- bills %>% rename('bill_id' = 'Legislation.Number',
+         'status' = 'Latest.Tracker.Stage',
+         'summary' = 'Latest.Summary')
+
+# isolate desired columns
+bills <- subset(bills, select = c(bill_id, status, summary))
+
+# drop bills that have no summary
+bills <- bills %>% filter(nchar(summary) > 1)
+
+```
+
+```{r}
+
+```
