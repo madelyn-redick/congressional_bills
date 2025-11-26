@@ -90,7 +90,7 @@ y <- torch_tensor(bills$label, dtype = torch_float())
 ```
 
 ```{r}
-# train test split #TODO VALIDATION SET?
+# train test split 
 num_rows <- nrow(bills)
 train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
 
@@ -99,4 +99,86 @@ y_train <- y[train_idx]
 
 x_test  <- X[-train_idx, ]
 y_test  <- y[-train_idx]
+```
+
+```{r}
+# model architecture
+cnn_model <- nn_module(
+  initialize = function() {
+    
+    embedding_dim <- 100
+    num_filters <- 100
+    kernel_size <- 5
+    
+    self$embedding <- nn_embedding(
+      num_embeddings = vocab_size,
+      embedding_dim = embedding_dim,
+      padding_idx = stoi[["<pad>"]])
+    
+    self$conv <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = kernel_size)
+    
+    self$fc <- nn_linear(
+      in_features = num_filters * (MAX_LEN - kernel_size + 1),
+      out_features = 1)
+  },
+  
+  forward = function(x) { # TEST ARCHITECTURE - tune later
+    # setup
+    x <- self$embedding(x)    
+    x <- x$permute(c(1, 3, 2)) # reorder dims
+    
+    x <- self$conv(x) # 1D convolution layer
+    x <- torch_relu(x) # ReLU activation function
+    
+    x <- torch_flatten(x, start_dim = 2)  # flatten 
+    
+    x <- self$fc(x) # fully connected layer
+    torch_sigmoid(x) # sigmoid output function
+  }
+)
+
+# initialize
+model <- cnn_model()
+
+# define loss function and optimizer
+loss_fn <- nn_bce_loss() # binary classification entropy loss function
+optimizer <- optim_adam(model$parameters, lr = 0.001) #TODO TEST USING SGD
+```
+```{r}
+# training setup
+epochs <- 10
+batch_size <- 32
+n <- length(y_train)
+
+# train model
+for (epoch in seq_len(epochs)) {
+  model$train()
+  epoch_loss <- 0
+  idx <- sample(1:length(y_train))  # shuffle
+  
+  for (i in seq(1, length(idx), by = batch_size)) {
+    # batch
+    start <- i
+    end <- min(i + batch_size - 1, n)
+    inputs <- x_train[start:end]
+    output <- y_train[start:end]
+    
+    # forward pass
+    preds <- model(inputs)
+    loss <- loss_fn(preds, output)
+    
+    # backpropagation
+    optimizer$zero_grad()
+    loss$backward()
+    optimizer$step()
+    
+    epoch_loss <- epoch_loss + loss$item()
+  }
+  
+  cat(sprintf("Epoch %d, Loss: %.4f\n", epoch,
+              epoch_loss / (length(idx) / batch_size)))
+}
 ```
