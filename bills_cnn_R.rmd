@@ -5,14 +5,16 @@ date: "2025-11-18"
 output: html_document
 ---
 ```{r}
-# imports 
+# imports / setup
+set.seed(42)
 library(dplyr)
 library(xml2)
 library(stringr)
 #install.packages("torch")  # if not already installed
 library(torch)
 #install_torch(version = "latest", type = "binary")
-
+```
+```{r}
 # load data
 bills <- read.csv("bill_details.csv")
 
@@ -85,4 +87,16 @@ X <- torch_tensor(
 
 # build label data
 y <- torch_tensor(bills$label, dtype = torch_float())
+```
+
+```{r}
+# train test split #TODO VALIDATION SET?
+num_rows <- nrow(bills)
+train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
+
+x_train <- X[train_idx, ]
+y_train <- y[train_idx]
+
+x_test  <- X[-train_idx, ]
+y_test  <- y[-train_idx]
 ```
