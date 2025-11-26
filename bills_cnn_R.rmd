@@ -4,10 +4,14 @@ author: "Madelyn Redick"
 date: "2025-11-18"
 output: html_document
 ---
-
 ```{r}
 # imports 
 library(dplyr)
+library(xml2)
+library(stringr)
+#install.packages("torch")  # if not already installed
+library(torch)
+#install_torch(version = "latest", type = "binary")
 
 # load data
 bills <- read.csv("bill_details.csv")
@@ -23,8 +27,62 @@ bills <- subset(bills, select = c(bill_id, status, summary))
 # drop bills that have no summary
 bills <- bills %>% filter(nchar(summary) > 1)
 
+# clean html text
+clean_html_text <- function(text) {
+  gsub("<.*?>", "", text)
+}
+bills$summary <- clean_html_text(bills$summary)
+
+# TODO MAYBE - RECLASSIFY ALL BILLS OTHER THAN became law AS did not become law
+bills$label <- as.integer(bills$status == "Became Law")
+bills <- subset(bills, select=c(bill_id, label, summary))
+bills
 ```
-
 ```{r}
+# tokenize
+tokenize <- function(text) {
+  str_split(text, " ")[[1]]
+}
+all_tokens <- unlist(lapply(bills$summary, tokenize))
 
+# get vocab
+vocab <- unique(all_tokens)
+
+# map words to unique IDs
+stoi <- setNames(seq_along(vocab), vocab) 
+vocab <- vocab[vocab != ""] # remove empties
+stoi[["<unk>"]] <- length(stoi) + 1 # create token for words not in vocab
+stoi[["<pad>"]] <- length(stoi) + 1 # used to make sequences a fixed length
+vocab_size <- length(stoi)
+
+# convert text to int sequences
+text_to_int <- function(text, max_len = 200) {
+  # tokenize
+  tokens <- tokenize(text)
+
+  # replace each word with its integer ID
+  ids <- match(tokens, names(stoi))
+
+  # replace NAs with <unk> token ID
+  ids[is.na(ids)] <- stoi[["<unk>"]]
+
+  # pad / truncate to make sequences a fixed length
+  if (length(ids) < max_len) {
+    ids <- c(ids, rep(stoi[["<pad>"]], max_len - length(ids)))
+  } else {
+    ids <- ids[1:max_len]
+  }
+
+  ids
+}
+
+
+# build input data
+X <- torch_tensor(
+  do.call(rbind, lapply(bills$summary, text_to_int, max_len = 200)),
+  dtype = torch_long()
+)
+
+# build label data
+y <- torch_tensor(bills$label, dtype = torch_float())
 ```
