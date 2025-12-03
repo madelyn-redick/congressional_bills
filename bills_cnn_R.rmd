@@ -14,6 +14,7 @@ library(stringr)
 library(torch)
 #install_torch(version = "latest", type = "binary")
 ```
+
 ```{r}
 # load data
 bills <- read.csv("bill_details.csv")
@@ -35,9 +36,9 @@ clean_html_text <- function(text) {
 }
 bills$summary <- clean_html_text(bills$summary)
 
-# TODO MAYBE - RECLASSIFY ALL BILLS OTHER THAN became law AS did not become law
-bills$label <- as.integer(bills$status == "Became Law")
-bills <- subset(bills, select=c(bill_id, label, summary))
+# reclassify all bills other than 'became law' for binary classification
+#bills$label <- as.integer(bills$status == "Became Law")
+#bills <- subset(bills, select=c(bill_id, label, summary))
 bills
 ```
 ```{r}
@@ -85,8 +86,14 @@ X <- torch_tensor(
   dtype = torch_long()
 )
 
+# label encoding
+labels_words <- unique(bills$status)
+labels <- as.integer(as.factor(bills$status)) 
+num_classes <- length(unique(labels))
+bills$label <- labels
+
 # build label data
-y <- torch_tensor(bills$label, dtype = torch_float())
+y <- torch_tensor(bills$label, dtype = torch_long())
 ```
 
 ```{r}
@@ -104,7 +111,7 @@ y_test  <- y[-train_idx]
 ```{r}
 # model architecture
 cnn_model <- nn_module(
-  initialize = function() {
+  initialize = function(num_classes) {
     
     embedding_dim <- 100
     num_filters <- 100
@@ -113,40 +120,50 @@ cnn_model <- nn_module(
     self$embedding <- nn_embedding(
       num_embeddings = vocab_size,
       embedding_dim = embedding_dim,
-      padding_idx = stoi[["<pad>"]])
+      padding_idx = stoi[["<pad>"]]
+    )
     
     self$conv <- nn_conv1d(
       in_channels = embedding_dim,
       out_channels = num_filters,
-      kernel_size = kernel_size)
+      kernel_size = kernel_size
+    )
     
     self$fc <- nn_linear(
       in_features = num_filters * (MAX_LEN - kernel_size + 1),
-      out_features = 1)
+      out_features = num_classes   
+    )
   },
   
-  forward = function(x) { # TEST ARCHITECTURE - tune later
-    # setup
-    x <- self$embedding(x)    
-    x <- x$permute(c(1, 3, 2)) # reorder dims
-    
-    x <- self$conv(x) # 1D convolution layer
-    x <- torch_relu(x) # ReLU activation function
-    
-    x <- torch_flatten(x, start_dim = 2)  # flatten 
-    
-    x <- self$fc(x) # fully connected layer
-    torch_sigmoid(x) # sigmoid output function
+  forward = function(x) {
+    x <- self$embedding(x)
+    x <- x$permute(c(1, 3, 2))
+    x <- self$conv(x)
+    x <- torch_relu(x)
+    x <- torch_flatten(x, start_dim = 2)
+    logits <- self$fc(x)
+
+    return(logits)   
   }
 )
 
+
 # initialize
-model <- cnn_model()
+model <- cnn_model(num_classes)
 
 # define loss function and optimizer
-loss_fn <- nn_bce_loss() # binary classification entropy loss function
+#loss_fn <- nn_bce_loss() # binary classification entropy loss function TODO DELETE
+loss_fn <- nn_cross_entropy_loss() # categorical cross entropy loss function
+
+#class_counts <- table(bills$label) #TODO CHECK THIS PART
+#class_weights <- 1 / as.numeric(class_counts)
+#class_weights <- class_weights / sum(class_weights)
+#loss_fn <- nn_cross_entropy_loss(
+#weight = torch_tensor(class_weights, dtype = torch_float()))
+
 optimizer <- optim_adam(model$parameters, lr = 0.001) #TODO TEST USING SGD
 ```
+
 ```{r}
 # training setup
 epochs <- 10
@@ -178,7 +195,50 @@ for (epoch in seq_len(epochs)) {
     epoch_loss <- epoch_loss + loss$item()
   }
   
-  cat(sprintf("Epoch %d, Loss: %.4f\n", epoch,
-              epoch_loss / (length(idx) / batch_size)))
+  cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss / (length(idx) / batch_size)))
 }
+
+```
+```{r}
+# evaluate
+model$eval()
+
+# get logits
+logits <- model(x_test)
+
+# convert logits to predicted class index
+preds <- torch_argmax(logits, dim = 2)$to(dtype = torch_int())
+
+# convert to vectors
+true <- as_array(y_test)
+pred <- as_array(preds)
+
+# each class accuracy
+per_class_acc <- list()
+
+for (k in 1:num_classes) {
+  idx <- which(true == k)
+
+  if (length(idx) > 0) {
+    per_class_acc[k] <- mean(pred[idx] == true[idx])
+  } else {
+    per_class_acc[k] <- NA
+  }
+}
+
+cat("Class Accuracy:\n")
+for (i in 1:num_classes){
+  cat(sprintf("%s: %s\n", labels_words[i], per_class_acc[i]))
+}
+
+# overall accuracy
+cat("\n")
+overall_accuracy <- mean(true == pred)
+cat("Overall Accuracy:", overall_accuracy, "\n")
+
+# confusion matrix
+cat("\n")
+cat("Confusion Matrix:\n")
+cm <- table(True = true, Predicted = pred)
+print(cm)
 ```
