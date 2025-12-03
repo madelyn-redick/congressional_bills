@@ -15,9 +15,11 @@ library(torch)
 #install_torch(version = "latest", type = "binary")
 ```
 
+# MULTICLASS CLASSIFICATION
 ```{r}
 # load data
-bills <- read.csv("bill_details.csv")
+#bills <- read.csv("bill_details.csv")
+bills <- read.csv("bill_details_OLD.csv")
 
 # rename columns
 bills <- bills %>% rename('bill_id' = 'Legislation.Number',
@@ -35,10 +37,7 @@ clean_html_text <- function(text) {
   gsub("<.*?>", "", text)
 }
 bills$summary <- clean_html_text(bills$summary)
-
-# reclassify all bills other than 'became law' for binary classification
-#bills$label <- as.integer(bills$status == "Became Law")
-#bills <- subset(bills, select=c(bill_id, label, summary))
+bills_binary <- bills # save for binary classification
 bills
 ```
 ```{r}
@@ -55,7 +54,7 @@ vocab <- unique(all_tokens)
 stoi <- setNames(seq_along(vocab), vocab) 
 vocab <- vocab[vocab != ""] # remove empties
 stoi[["<unk>"]] <- length(stoi) + 1 # create token for words not in vocab
-stoi[["<pad>"]] <- length(stoi) + 1 # used to make sequences a fixed length
+stoi[["<pad>"]] <- length(stoi) + 1 # make sequences a fixed length
 vocab_size <- length(stoi)
 
 # convert text to int sequences
@@ -75,7 +74,6 @@ text_to_int <- function(text, max_len = 200) {
   } else {
     ids <- ids[1:max_len]
   }
-
   ids
 }
 
@@ -104,8 +102,8 @@ train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
 x_train <- X[train_idx, ]
 y_train <- y[train_idx]
 
-x_test  <- X[-train_idx, ]
-y_test  <- y[-train_idx]
+x_test <- X[-train_idx, ]
+y_test <- y[-train_idx]
 ```
 
 ```{r}
@@ -115,7 +113,6 @@ cnn_model <- nn_module(
     
     embedding_dim <- 100
     num_filters <- 100
-    kernel_size <- 5
     
     self$embedding <- nn_embedding(
       num_embeddings = vocab_size,
@@ -123,50 +120,87 @@ cnn_model <- nn_module(
       padding_idx = stoi[["<pad>"]]
     )
     
-    self$conv <- nn_conv1d(
+    self$conv1 <- nn_conv1d(
       in_channels = embedding_dim,
       out_channels = num_filters,
-      kernel_size = kernel_size
+      kernel_size = 2
     )
     
+    self$conv2 <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = 3
+    )
+    
+    self$conv3 <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = 5
+    )
+    
+    self$dropout <- nn_dropout(p = 0.3) # TODO change rate?
+    
     self$fc <- nn_linear(
-      in_features = num_filters * (MAX_LEN - kernel_size + 1),
+      in_features = num_filters * 3, 
       out_features = num_classes   
     )
   },
   
   forward = function(x) {
-    x <- self$embedding(x)
+    x <- self$embedding(x) # (batch, 100, MAX_LEN)
     x <- x$permute(c(1, 3, 2))
-    x <- self$conv(x)
-    x <- torch_relu(x)
-    x <- torch_flatten(x, start_dim = 2)
-    logits <- self$fc(x)
+    
+    # 'parallel' conv -> ReLU -> max pool -> squeeze (TODO) for the same input but with different gram sizes
+    x1 <- self$conv1(x) # 2 gram conv
+    x1 <- torch_relu(x1)
+    x1 <- nnf_max_pool1d(x1, kernel_size = x1$size(3))
+    x1 <- x1$squeeze(3) 
+    
+    x2 <- self$conv2(x) # 3 gram conv
+    x2 <- torch_relu(x2)
+    x2 <- nnf_max_pool1d(x2, kernel_size = x2$size(3))
+    x2 <- x2$squeeze(3)
+    
+    x3 <- self$conv3(x) # 5 gram conv
+    x3 <- torch_relu(x3)
+    x3 <- nnf_max_pool1d(x3, kernel_size = x3$size(3))
+    x3 <- x3$squeeze(3)
+    
+    # combine feat vectors (batch × 300)
+    x <- torch_cat(list(x1, x2, x3), dim = 2)
 
+    x <- self$dropout(x) # dropout regularization
+    
+    x <- torch_flatten(x, start_dim = 2) 
+    
+    logits <- self$fc(x)
     return(logits)   
   }
 )
 
-
 # initialize
 model <- cnn_model(num_classes)
 
-# define loss function and optimizer
-#loss_fn <- nn_bce_loss() # binary classification entropy loss function TODO DELETE
-loss_fn <- nn_cross_entropy_loss() # categorical cross entropy loss function
+# define loss function and optimize
+loss_fn <- nn_cross_entropy_loss() 
 
-#class_counts <- table(bills$label) #TODO CHECK THIS PART
-#class_weights <- 1 / as.numeric(class_counts)
-#class_weights <- class_weights / sum(class_weights)
-#loss_fn <- nn_cross_entropy_loss(
-#weight = torch_tensor(class_weights, dtype = torch_float()))
+# weight each class
+class_counts <- table(bills$label) 
+class_weights <- 1 / as.numeric(class_counts)
+class_weights <- class_weights / sum(class_weights)
+loss_fn <- nn_cross_entropy_loss(weight = torch_tensor(class_weights, dtype = torch_float()))
 
-optimizer <- optim_adam(model$parameters, lr = 0.001) #TODO TEST USING SGD
+# ADAM optimization
+optimizer <- optim_adam(model$parameters, lr = 0.001)
+
+class_counts <- table(bills$label)
+cat("Class distribution:")
+print(class_counts)
 ```
 
 ```{r}
 # training setup
-epochs <- 10
+epochs <- 3 #300
 batch_size <- 32
 n <- length(y_train)
 
@@ -180,12 +214,13 @@ for (epoch in seq_len(epochs)) {
     # batch
     start <- i
     end <- min(i + batch_size - 1, n)
-    inputs <- x_train[start:end]
-    output <- y_train[start:end]
+    batch_indices <- torch_tensor(idx[start:end], dtype = torch_long())
+    batch_inputs <- x_train$index_select(1, batch_indices)
+    batch_labels <- y_train$index_select(1, batch_indices)
     
     # forward pass
-    preds <- model(inputs)
-    loss <- loss_fn(preds, output)
+    preds <- model(batch_inputs)
+    loss <- loss_fn(preds, batch_labels)
     
     # backpropagation
     optimizer$zero_grad()
@@ -194,9 +229,16 @@ for (epoch in seq_len(epochs)) {
     
     epoch_loss <- epoch_loss + loss$item()
   }
-  
-  cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss / (length(idx) / batch_size)))
+  if (epoch %% 10 == 0) {
+    cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))
+    }
 }
+
+# dimensions
+dim(batch_inputs)
+batch_inputs$shape
+class(model) 
+model
 
 ```
 ```{r}
@@ -230,6 +272,160 @@ cat("Class Accuracy:\n")
 for (i in 1:num_classes){
   cat(sprintf("%s: %s\n", labels_words[i], per_class_acc[i]))
 }
+
+# overall accuracy
+overall_accuracy <- mean(true == pred)
+cat("\nOverall Accuracy:", overall_accuracy, "\n")
+
+# confusion matrix
+cat("\nConfusion Matrix:\n")
+cm <- table(True = true, Predicted = pred)
+print(cm)
+```
+# BINARY CLASSIFICATION
+
+```{r}
+# reclassify all bills other than 'became law' for binary classification
+bills_binary$label <- as.integer(bills$status == "Became Law")
+bills_binary <- subset(bills_binary, select=c(bill_id, label, summary))
+
+# build input data
+X <- torch_tensor(
+  do.call(rbind, lapply(bills_binary$summary, text_to_int, max_len = 200)),
+  dtype = torch_long()
+)
+
+# label encoding
+labels <- as.integer(bills$status == "Became Law")
+num_classes <- length(unique(labels))
+bills_binary$label <- labels
+
+# build label data
+y <- torch_tensor(labels, dtype = torch_float())
+
+# train test split 
+num_rows <- nrow(bills_binary)
+train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
+
+x_train <- X[train_idx, ]
+y_train <- y[train_idx]
+
+x_test <- X[-train_idx, ]
+y_test <- y[-train_idx]
+
+# model architecture
+binary_cnn_model <- nn_module(
+  initialize = function() {
+    
+    embedding_dim <- 100
+    num_filters <- 100
+    kernel_size <- 5
+    
+    self$embedding <- nn_embedding(
+      num_embeddings = vocab_size,
+      embedding_dim = embedding_dim,
+      padding_idx = stoi[["<pad>"]]
+    )
+    
+    self$conv <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = kernel_size
+    )
+    
+    self$fc <- nn_linear(
+      in_features = num_filters * (MAX_LEN - kernel_size + 1),
+      out_features = 1   
+    )
+  },
+  
+  forward = function(x) {
+    x <- self$embedding(x)
+    x <- x$permute(c(1, 3, 2))
+    x <- self$conv(x)
+    x <- torch_relu(x)
+    x <- torch_flatten(x, start_dim = 2)
+    logits <- self$fc(x)
+    return(logits) 
+  }
+)
+
+
+# initialize
+model <- binary_cnn_model()
+
+# weight each class
+class_counts <- table(bills_binary$label)
+class_weights <- torch_tensor(as.numeric(class_counts["0"] / class_counts["1"]), dtype = torch_float())
+
+# define loss function
+loss_fn <- nn_bce_with_logits_loss(pos_weight = class_weights)
+
+# ADAM optimization
+optimizer <- optim_adam(model$parameters, lr = 0.001) 
+
+cat("Class distribution:")
+print(class_counts)
+```
+
+```{r}
+#train
+epochs <- 30
+batch_size <- 32
+for (epoch in seq_len(epochs)) {
+  model$train()
+  epoch_loss <- 0
+  n <- length(y_train)
+  idx <- sample(1:n)
+  
+  for (i in seq(1, n, by = batch_size)) {
+    end <- min(i + batch_size - 1, n)
+    batch_idx <- idx[i:end]
+    
+    inputs <- x_train[batch_idx, ]
+    targets <- y_train[batch_idx]$view(c(-1, 1))
+    
+    # forward pass
+    #preds <- model(inputs)
+    preds <- model$forward(batch_inputs)
+
+    loss <- loss_fn(preds, targets)
+    
+    # backpropagation
+    optimizer$zero_grad()
+    loss$backward()
+    optimizer$step()
+    
+    epoch_loss <- epoch_loss + loss$item()
+  }
+  if (epoch %% 10 == 0){cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))}
+  #cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))
+}
+
+# evaluate
+model$eval()
+
+# get logits
+logits <- model(x_test)
+
+# convert logits to predicted class index
+probs <- torch_sigmoid(logits)
+preds <- (probs > 0.5)$to(dtype = torch_int())
+
+# convert to vectors
+true <- as_array(y_test)
+pred <- as_array(preds)
+
+# each class accuracy
+class_0_idx <- which(true == 0)
+class_1_idx <- which(true == 1)
+
+acc_class_0 <- mean(pred[class_0_idx] == true[class_0_idx])
+acc_class_1 <- mean(pred[class_1_idx] == true[class_1_idx])
+
+cat("\nClass Accuracy:\n")
+cat(sprintf("Not Became Law (0): %.4f\n", acc_class_0))
+cat(sprintf("Became Law (1): %.4f\n", acc_class_1))
 
 # overall accuracy
 cat("\n")
