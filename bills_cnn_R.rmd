@@ -10,6 +10,8 @@ set.seed(42)
 library(dplyr)
 library(xml2)
 library(stringr)
+library(ggplot2)
+library(reshape2)
 #install.packages("torch")  # if not already installed
 library(torch)
 #install_torch(version = "latest", type = "binary")
@@ -18,8 +20,7 @@ library(torch)
 # MULTICLASS CLASSIFICATION
 ```{r}
 # load data
-#bills <- read.csv("bill_details.csv")
-bills <- read.csv("bill_details_OLD.csv")
+bills <- read.csv("bill_sums.csv")
 
 # rename columns
 bills <- bills %>% rename('bill_id' = 'Legislation.Number',
@@ -41,7 +42,7 @@ bills_binary <- bills # save for binary classification
 bills
 ```
 ```{r}
-# tokenize
+# tokenize: get vector of words in bill text
 tokenize <- function(text) {
   str_split(text, " ")[[1]]
 }
@@ -50,7 +51,7 @@ all_tokens <- unlist(lapply(bills$summary, tokenize))
 # get vocab
 vocab <- unique(all_tokens)
 
-# map words to unique IDs
+# string to ints: map words to unique IDs
 stoi <- setNames(seq_along(vocab), vocab) 
 vocab <- vocab[vocab != ""] # remove empties
 stoi[["<unk>"]] <- length(stoi) + 1 # create token for words not in vocab
@@ -58,7 +59,7 @@ stoi[["<pad>"]] <- length(stoi) + 1 # make sequences a fixed length
 vocab_size <- length(stoi)
 
 # convert text to int sequences
-text_to_int <- function(text, max_len = 200) {
+text_to_int <- function(text, max_len = 200) { # returns vector of ints that represent IDs for each word in vocab
   # tokenize
   tokens <- tokenize(text)
 
@@ -77,8 +78,7 @@ text_to_int <- function(text, max_len = 200) {
   ids
 }
 
-
-# build input data
+# build input data. each row is a bill text, each col represents token positions within the vector
 X <- torch_tensor(
   do.call(rbind, lapply(bills$summary, text_to_int, max_len = 200)),
   dtype = torch_long()
@@ -92,6 +92,7 @@ bills$label <- labels
 
 # build label data
 y <- torch_tensor(bills$label, dtype = torch_long())
+X
 ```
 
 ```{r}
@@ -108,18 +109,18 @@ y_test <- y[-train_idx]
 
 ```{r}
 # model architecture
-cnn_model <- nn_module(
+multiclass_cnn <- nn_module(
   initialize = function(num_classes) {
     
     embedding_dim <- 100
     num_filters <- 100
     
-    self$embedding <- nn_embedding(
+    self$embedding <- nn_embedding( # converts word IDs to semantic meanings through backprop in training. allows model to learn relationships between words
       num_embeddings = vocab_size,
       embedding_dim = embedding_dim,
       padding_idx = stoi[["<pad>"]]
     )
-    
+     
     self$conv1 <- nn_conv1d(
       in_channels = embedding_dim,
       out_channels = num_filters,
@@ -138,19 +139,19 @@ cnn_model <- nn_module(
       kernel_size = 5
     )
     
-    self$dropout <- nn_dropout(p = 0.3) # TODO change rate?
+    self$dropout <- nn_dropout(p = 0.3) 
     
-    self$fc <- nn_linear(
+    self$fc <- nn_linear( # creates scores of how strongly model thinks each class is correct
       in_features = num_filters * 3, 
       out_features = num_classes   
-    )
+    ) # loss function applies softmax output function internally during training loop
   },
   
   forward = function(x) {
     x <- self$embedding(x) # (batch, 100, MAX_LEN)
     x <- x$permute(c(1, 3, 2))
     
-    # 'parallel' conv -> ReLU -> max pool -> squeeze (TODO) for the same input but with different gram sizes
+    # 'parallel' conv -> ReLU -> max pool -> squeeze for the same input but with different gram sizes
     x1 <- self$conv1(x) # 2 gram conv
     x1 <- torch_relu(x1)
     x1 <- nnf_max_pool1d(x1, kernel_size = x1$size(3))
@@ -173,16 +174,13 @@ cnn_model <- nn_module(
     
     x <- torch_flatten(x, start_dim = 2) 
     
-    logits <- self$fc(x)
+    logits <- self$fc(x) # logits are relative scores of classes
     return(logits)   
   }
 )
 
 # initialize
-model <- cnn_model(num_classes)
-
-# define loss function and optimize
-loss_fn <- nn_cross_entropy_loss() 
+model <- multiclass_cnn(num_classes)
 
 # weight each class
 class_counts <- table(bills$label) 
@@ -193,14 +191,14 @@ loss_fn <- nn_cross_entropy_loss(weight = torch_tensor(class_weights, dtype = to
 # ADAM optimization
 optimizer <- optim_adam(model$parameters, lr = 0.001)
 
-class_counts <- table(bills$label)
+class_counts <- table(bills$status)
 cat("Class distribution:")
 print(class_counts)
 ```
 
 ```{r}
 # training setup
-epochs <- 3 #300
+epochs <- 300
 batch_size <- 32
 n <- length(y_train)
 
@@ -279,13 +277,47 @@ cat("\nOverall Accuracy:", overall_accuracy, "\n")
 
 # confusion matrix
 cat("\nConfusion Matrix:\n")
-cm <- table(True = true, Predicted = pred)
-print(cm)
+cm_multi <- table(True = true, Predicted = pred)
+print(cm_multi)
+```
+```{r}
+# heatmap
+cm_multi_df <- melt(cm_multi)
+label_order <- c("Introduced", "Passed Senate", "Passed House", 
+                  "Failed Senate", "Failed House", "Resolving Differences", 
+                  "To President", "Vetoed by President", 
+                  "Failed to pass over veto", "Became Law")
+
+# map numerical labels to categorical
+label_mapping <- data.frame(
+  number = 1:num_classes,
+  word = sort(unique(bills$status))  # sort to match
+)
+cm_multi_df$Predicted <- label_mapping$word[match(cm_multi_df$Predicted, label_mapping$number)]
+cm_multi_df$True <- label_mapping$word[match(cm_multi_df$True, label_mapping$number)]
+
+# preserve order
+cm_multi_df$Predicted <- factor(cm_multi_df$Predicted, levels = label_order)
+cm_multi_df$True <- factor(cm_multi_df$True, levels = label_order)
+
+# plot heatmap
+ggplot(cm_multi_df, aes(x = Predicted, y = True, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = value), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = "#1f77b4", name = "Count") +
+  labs(title = "Confusion Matrix - Multi Classification",
+       x = "Predicted",
+       y = "True") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10),
+        axis.title = element_text(size = 12))
 ```
 # BINARY CLASSIFICATION
 
 ```{r}
-# reclassify all bills other than 'became law' for binary classification
+# reclassify all bills other than 'became law' for binary classification 
 bills_binary$label <- as.integer(bills$status == "Became Law")
 bills_binary <- subset(bills_binary, select=c(bill_id, label, summary))
 
@@ -314,12 +346,11 @@ x_test <- X[-train_idx, ]
 y_test <- y[-train_idx]
 
 # model architecture
-binary_cnn_model <- nn_module(
+binaryclass_cnn <- nn_module(
   initialize = function() {
     
     embedding_dim <- 100
     num_filters <- 100
-    kernel_size <- 5
     
     self$embedding <- nn_embedding(
       num_embeddings = vocab_size,
@@ -327,14 +358,28 @@ binary_cnn_model <- nn_module(
       padding_idx = stoi[["<pad>"]]
     )
     
-    self$conv <- nn_conv1d(
+    self$conv1 <- nn_conv1d(
       in_channels = embedding_dim,
       out_channels = num_filters,
-      kernel_size = kernel_size
+      kernel_size = 2
     )
     
+    self$conv2 <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = 3
+    )
+    
+    self$conv3 <- nn_conv1d(
+      in_channels = embedding_dim,
+      out_channels = num_filters,
+      kernel_size = 5
+    )
+    
+    self$dropout <- nn_dropout(p = 0.3) 
+    
     self$fc <- nn_linear(
-      in_features = num_filters * (MAX_LEN - kernel_size + 1),
+      in_features = num_filters * 3, 
       out_features = 1   
     )
   },
@@ -342,21 +387,41 @@ binary_cnn_model <- nn_module(
   forward = function(x) {
     x <- self$embedding(x)
     x <- x$permute(c(1, 3, 2))
-    x <- self$conv(x)
-    x <- torch_relu(x)
-    x <- torch_flatten(x, start_dim = 2)
+    
+    # 'parallel' conv -> ReLU -> max pool for the same input but with different gram sizes
+    x1 <- self$conv1(x) # 2 gram conv
+    x1 <- torch_relu(x1)
+    x1 <- nnf_max_pool1d(x1, kernel_size = x1$size(3))
+    
+    x2 <- self$conv2(x) # 3 gram conv
+    x2 <- torch_relu(x2)
+    x2 <- nnf_max_pool1d(x2, kernel_size = x2$size(3))
+    
+    x3 <- self$conv3(x) # 5 gram conv
+    x3 <- torch_relu(x3)
+    x3 <- nnf_max_pool1d(x3, kernel_size = x3$size(3))
+    
+    # combine feat vectors (batch × 300)
+    x <- torch_cat(list(x1, x2, x3), dim = 2)
+
+    x <- self$dropout(x) # dropout regularization
+    
+    x <- torch_flatten(x, start_dim = 2) 
+    
     logits <- self$fc(x)
-    return(logits) 
+    return(logits)  
   }
 )
 
 
 # initialize
-model <- binary_cnn_model()
+model <- binaryclass_cnn()
 
 # weight each class
 class_counts <- table(bills_binary$label)
-class_weights <- torch_tensor(as.numeric(class_counts["0"] / class_counts["1"]), dtype = torch_float())
+pos_w <- as.numeric(class_counts["0"] / class_counts["1"])
+pos_w <- min(pos_w, 20)
+class_weights <- torch_tensor(pos_w, dtype = torch_float())
 
 # define loss function
 loss_fn <- nn_bce_with_logits_loss(pos_weight = class_weights)
@@ -370,8 +435,6 @@ print(class_counts)
 
 ```{r}
 #train
-epochs <- 30
-batch_size <- 32
 for (epoch in seq_len(epochs)) {
   model$train()
   epoch_loss <- 0
@@ -386,9 +449,7 @@ for (epoch in seq_len(epochs)) {
     targets <- y_train[batch_idx]$view(c(-1, 1))
     
     # forward pass
-    #preds <- model(inputs)
-    preds <- model$forward(batch_inputs)
-
+    preds <- model(inputs)
     loss <- loss_fn(preds, targets)
     
     # backpropagation
@@ -399,8 +460,16 @@ for (epoch in seq_len(epochs)) {
     epoch_loss <- epoch_loss + loss$item()
   }
   if (epoch %% 10 == 0){cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))}
-  #cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))
 }
+
+# dimensions
+dim(batch_inputs)
+batch_inputs$shape
+class(model) 
+model
+```
+
+```{r}
 
 # evaluate
 model$eval()
@@ -408,8 +477,8 @@ model$eval()
 # get logits
 logits <- model(x_test)
 
-# convert logits to predicted class index
-probs <- torch_sigmoid(logits)
+# convert logits to prob
+probs <- torch_sigmoid(logits) 
 preds <- (probs > 0.5)$to(dtype = torch_int())
 
 # convert to vectors
@@ -435,6 +504,32 @@ cat("Overall Accuracy:", overall_accuracy, "\n")
 # confusion matrix
 cat("\n")
 cat("Confusion Matrix:\n")
-cm <- table(True = true, Predicted = pred)
-print(cm)
+cm_bin <- table(True = true, Predicted = pred)
+print(cm_bin)
+```
+```{r}
+# heatmap and losses over time
+cm_bin_df <- melt(cm_bin)
+
+# map numerical labels to categorical
+cm_bin_df$Predicted <- label_mapping$word[match(cm_bin_df$Predicted, label_mapping$number)]
+cm_bin_df$True <- label_mapping$word[match(cm_bin_df$True, label_mapping$number)]
+
+# preserve order
+cm_bin_df$Predicted <- factor(cm_bin_df$Predicted, levels = label_mapping$word)
+cm_bin_df$True <- factor(cm_bin_df$True, levels = label_mapping$word)
+
+# plot heatmap
+ggplot(cm_bin_df, aes(x = Predicted, y = True, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = value), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = "#1f77b4", name = "Count") +
+  labs(title = "Confusion Matrix - Binary Classification",
+       x = "Predicted",
+       y = "True") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, hjust = 0.5),
+        axis.text.y = element_text(size = 10),
+        axis.title = element_text(size = 12))
 ```
