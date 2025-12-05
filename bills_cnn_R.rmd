@@ -98,13 +98,27 @@ X
 ```{r}
 # train test split 
 num_rows <- nrow(bills)
-train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
+idx <- sample(1:num_rows)
 
+train_end <- floor(0.70 * num_rows)
+val_end   <- floor(0.85 * num_rows)
+
+train_idx <- idx[1:train_end] # 70% of dataset
+val_idx   <- idx[(train_end+1):val_end] # 15% of dataset
+test_idx  <- idx[(val_end+1):num_rows] # 15% of dataset
+
+# create data splits
 x_train <- X[train_idx, ]
 y_train <- y[train_idx]
+x_val <- X[val_idx, ]
+y_val <- y[val_idx]
+x_test <- X[test_idx, ]
+y_test <- y[test_idx]
 
-x_test <- X[-train_idx, ]
-y_test <- y[-train_idx]
+cat("training samples:", length(train_idx), "\n")
+cat("testing samples:", length(test_idx), "\n")
+cat("validation samples:", length(val_idx))
+
 ```
 
 ```{r}
@@ -185,7 +199,6 @@ model <- multiclass_cnn(num_classes)
 # weight each class
 class_counts <- table(bills$label) 
 class_weights <- 1 / as.numeric(class_counts)
-class_weights <- class_weights / sum(class_weights)
 loss_fn <- nn_cross_entropy_loss(weight = torch_tensor(class_weights, dtype = torch_float()))
 
 # ADAM optimization
@@ -198,7 +211,7 @@ print(class_counts)
 
 ```{r}
 # training setup
-epochs <- 300
+epochs <- 75
 batch_size <- 32
 n <- length(y_train)
 
@@ -227,8 +240,27 @@ for (epoch in seq_len(epochs)) {
     
     epoch_loss <- epoch_loss + loss$item()
   }
+  
+  # validation!
+  model$eval()
+  with_no_grad({ # temporarily disable gradient calculation to speed up model since there's no weight update in validation anyway
+    val_logits <- model(x_val)
+    val_preds <- torch_argmax(val_logits, dim = 2)
+    val_acc <- mean(as_array(val_preds) == as_array(y_val))
+  })
+  
+  # compare model performance and save best model
+  if (val_acc > best_val_acc) {
+    best_val_acc <- val_acc
+    torch_save(model, "multiclass_model.pt")
+  }
+  
+  val_loss <- loss_fn(val_logits, y_val)$item()
+  
   if (epoch %% 10 == 0) {
-    cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))
+    cat(sprintf("epoch %d, train loss: %.4f\n", epoch, epoch_loss))
+    cat(sprintf("epoch %d, validation loss: %.4f\n", epoch, val_loss))
+    cat("\n")
     }
 }
 
@@ -337,13 +369,24 @@ y <- torch_tensor(labels, dtype = torch_float())
 
 # train test split 
 num_rows <- nrow(bills_binary)
-train_idx <- sample(1:num_rows, size = round(0.75*num_rows), replace=FALSE)
+idx <- sample(1:num_rows)
+train_end <- floor(0.70 * num_rows)
+val_end   <- floor(0.85 * num_rows)
+train_idx <- idx[1:train_end] # 70% of dataset
+val_idx   <- idx[(train_end+1):val_end] # 15% of dataset
+test_idx  <- idx[(val_end+1):num_rows] # 15% of dataset
 
+# create data splits
 x_train <- X[train_idx, ]
 y_train <- y[train_idx]
+x_test <- X[test_idx, ]
+y_test <- y[test_idx]
+x_val <- X[val_idx, ]
+y_val <- y[val_idx]
 
-x_test <- X[-train_idx, ]
-y_test <- y[-train_idx]
+cat("training samples:", length(train_idx), "\n")
+cat("testing samples:", length(test_idx), "\n")
+cat("validation samples:", length(val_idx))
 
 # model architecture
 binaryclass_cnn <- nn_module(
@@ -429,7 +472,7 @@ loss_fn <- nn_bce_with_logits_loss(pos_weight = class_weights)
 # ADAM optimization
 optimizer <- optim_adam(model$parameters, lr = 0.001) 
 
-cat("Class distribution:")
+cat("\nClass distribution:")
 print(class_counts)
 ```
 
@@ -459,7 +502,30 @@ for (epoch in seq_len(epochs)) {
     
     epoch_loss <- epoch_loss + loss$item()
   }
-  if (epoch %% 10 == 0){cat(sprintf("epoch %d, loss: %.4f\n", epoch, epoch_loss))}
+  # validation!
+  model$eval()
+  with_no_grad({ # temporarily disable gradient calculation to speed up model since there's no weight update in validation anyway
+    val_logits <- model(x_val)
+    val_labels <- y_val$unsqueeze(2) 
+    val_probs <- torch_sigmoid(val_logits)
+    val_preds <- (val_probs > 0.3)$to(dtype = torch_float())
+    val_acc <- mean(as_array(val_preds) == as_array(val_labels))
+
+  })
+  
+  # compare model performance and save best model
+  if (val_acc > best_val_acc) {
+    best_val_acc <- val_acc
+    torch_save(model, "binary_model.pt")
+  }
+  
+  val_loss <- loss_fn(val_logits, val_labels)$item()
+  
+  if (epoch %% 10 == 0) {
+    cat(sprintf("epoch %d, train loss: %.4f\n", epoch, epoch_loss))
+    cat(sprintf("epoch %d, validation loss: %.4f\n", epoch, val_loss))
+    cat("\n")
+    }
 }
 
 # dimensions
@@ -470,7 +536,6 @@ model
 ```
 
 ```{r}
-
 # evaluate
 model$eval()
 
@@ -492,18 +557,16 @@ class_1_idx <- which(true == 1)
 acc_class_0 <- mean(pred[class_0_idx] == true[class_0_idx])
 acc_class_1 <- mean(pred[class_1_idx] == true[class_1_idx])
 
-cat("\nClass Accuracy:\n")
+cat("Class Accuracy:\n")
 cat(sprintf("Not Became Law (0): %.4f\n", acc_class_0))
 cat(sprintf("Became Law (1): %.4f\n", acc_class_1))
 
 # overall accuracy
-cat("\n")
 overall_accuracy <- mean(true == pred)
-cat("Overall Accuracy:", overall_accuracy, "\n")
+cat("\nOverall Accuracy:", overall_accuracy, "\n")
 
 # confusion matrix
-cat("\n")
-cat("Confusion Matrix:\n")
+cat("\nConfusion Matrix:\n")
 cm_bin <- table(True = true, Predicted = pred)
 print(cm_bin)
 ```
@@ -512,6 +575,10 @@ print(cm_bin)
 cm_bin_df <- melt(cm_bin)
 
 # map numerical labels to categorical
+label_mapping <- data.frame(
+  number = c(0, 1),
+  word = c("Did Not Become Law", "Became Law")
+)
 cm_bin_df$Predicted <- label_mapping$word[match(cm_bin_df$Predicted, label_mapping$number)]
 cm_bin_df$True <- label_mapping$word[match(cm_bin_df$True, label_mapping$number)]
 
